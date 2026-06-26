@@ -84,12 +84,10 @@ Thumbs.db
 # ==========================
 
 # Raw downloaded data
-data/raw/*.csv
 data/raw/*.xlsx
 data/raw/*.xls
 
 # Processed datasets
-data/processed/*.parquet
 data/processed/*.csv
 
 # Model outputs
