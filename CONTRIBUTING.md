@@ -11,9 +11,6 @@ to run all the code that's currently in the repo.
   but is heavier.)
 - **Git** installed. Check by running `git --version` in a terminal. If not,
   install from https://git-scm.com/.
-- **A GitHub account** with access to this repo. Ira will have added you as a
-  collaborator — accept the invitation in your GitHub notifications first.
-- **A Google account** if you'll be running GARCHNet on Colab.
 
 ## Step 1: Clone the repo
 
