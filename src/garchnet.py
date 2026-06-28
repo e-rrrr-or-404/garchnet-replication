@@ -181,16 +181,17 @@ def train_garchnet(
     returns: np.ndarray,
     dist: DistName = "normal",
     p: int = 20,
-    epochs: int = 300,
+    epochs: int = 100,
     batch_size: int = 512,
     lr: float = 3e-4,
     seed: int = 1,
     device: str | None = None,
     verbose: bool = False,
-) -> GARCHNet:
+):
     """Fit a GARCHNet on a single window of returns.
 
-    Returns the trained model (on the chosen device, in eval mode).
+    Returns (model, scale_var) where scale_var is the variance used to rescale
+    the network's output back to the original returns' scale.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -200,31 +201,38 @@ def train_garchnet(
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    X, y = _make_sequences(returns, p)
-    X, y = X.to(device), y.to(device)
+    # Standardize: subtract sample mean (~0 for returns), divide by sample std.
+    # This makes LSTM inputs O(1) and gradients propagate properly.
+    train_mean = float(np.mean(returns))
+    train_var = float(np.var(returns))
+    train_std = float(np.sqrt(train_var))
+    returns_scaled = (returns - train_mean) / train_std
+
+    X_scaled, y_scaled = _make_sequences(returns_scaled, p)
+    # The TARGET for the NLL must be in scaled units to match the predicted scaled sigma2
+    X_scaled = X_scaled.to(device)
+    y_scaled = y_scaled.to(device)
 
     model = GARCHNet(dist=dist).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-    n = X.shape[0]
+    n = X_scaled.shape[0]
     for ep in range(epochs):
-        # Mini-batching by random permutation, in-memory.
         perm = torch.randperm(n, device=device)
         running = 0.0
         for start in range(0, n, batch_size):
             idx = perm[start : start + batch_size]
-            xb, yb = X[idx], y[idx]
+            xb, yb = X_scaled[idx], y_scaled[idx]
             out = model(xb)
             sigma2 = out["sigma2"]
             if dist == "normal":
                 loss = nll_normal(yb, sigma2)
             elif dist == "t":
                 loss = nll_student_t(yb, sigma2, out["eta"])
-            else:  # skewt
+            else:
                 loss = nll_skewed_t(yb, sigma2, out["eta"], out["lam"])
             opt.zero_grad()
             loss.backward()
-            # Gradient clipping: LSTMs occasionally explode.
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
             running += loss.item() * xb.shape[0]
@@ -232,45 +240,47 @@ def train_garchnet(
             print(f"    epoch {ep+1:3d}  nll={running/n:.5f}")
 
     model.eval()
+    # Stash the scaling info on the model so forecast_var can find it
+    model._train_mean = train_mean
+    model._train_var = train_var
     return model
 
 
-# -----------------------------------------------------------------------------
-# One-step-ahead VaR forecast from a trained GARCHNet
-# -----------------------------------------------------------------------------
-
 def forecast_var_garchnet(
-    model: GARCHNet,
+    model,
     last_p_returns: np.ndarray,
     alpha: float = 0.025,
 ) -> float:
-    """One-step-ahead VaR forecast given the most recent p returns.
-
-    last_p_returns: 1-d numpy array of length p (the p most recent returns).
-    """
+    """One-step-ahead VaR forecast on the original return scale."""
     device = next(model.parameters()).device
-    x = torch.from_numpy(last_p_returns.astype(np.float32)).view(1, -1, 1).to(device)
+    train_mean = getattr(model, "_train_mean", 0.0)
+    train_var = getattr(model, "_train_var", 1.0)
+    train_std = math.sqrt(train_var)
+
+    # Scale the input the same way the training data was scaled
+    last_p_scaled = (last_p_returns - train_mean) / train_std
+    x = torch.from_numpy(last_p_scaled.astype(np.float32)).view(1, -1, 1).to(device)
+
     with torch.no_grad():
         out = model(x)
-        sigma2 = out["sigma2"].item()
-    sigma = math.sqrt(sigma2)
+        sigma2_scaled = out["sigma2"].item()
+
+    # Convert from scaled-return variance back to original-return variance
+    sigma2_original = sigma2_scaled * train_var
+    sigma = math.sqrt(sigma2_original)
 
     if model.dist == "normal":
         from scipy.stats import norm
         q = norm.ppf(alpha)
     elif model.dist == "t":
-        # Standardized Student-t (unit variance) quantile.
         eta = out["eta"].item()
         from scipy.stats import t as t_dist
-        # The Student-t with df=eta has variance eta/(eta-2). To get unit
-        # variance we scale by sqrt((eta-2)/eta), so the alpha-quantile of the
-        # standardized variable is t.ppf(alpha, eta) * sqrt((eta-2)/eta).
         q = t_dist.ppf(alpha, df=eta) * math.sqrt((eta - 2.0) / eta)
-    else:  # skewt
+    else:
         eta = out["eta"].item()
         lam = out["lam"].item()
         from src.skewed_t import skewt_cdf
         from scipy.optimize import brentq
         q = brentq(lambda z: skewt_cdf(z, eta, lam) - alpha, -15, 15)
 
-    return sigma * q
+    return train_mean + sigma * q
